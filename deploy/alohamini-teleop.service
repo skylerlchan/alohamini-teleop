@@ -1,0 +1,25 @@
+[Unit]
+Description=AlohaMini web teleop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skyler
+WorkingDirectory=/home/skyler
+ExecStart=/home/skyler/lerobot_alohamini/.venv/bin/python -u /home/skyler/teleop_web.py
+
+# SIGTERM is what base_web.py traps to zero the wheels and drop torque.
+# Do not change this to SIGKILL: Feetech servos latch the last velocity
+# command, so a hard kill mid-motion leaves the robot driving.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/home/skyler/base_web.log
+StandardError=append:/home/skyler/base_web.log
+
+[Install]
+WantedBy=multi-user.target

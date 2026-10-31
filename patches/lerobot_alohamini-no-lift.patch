@@ -1,0 +1,52 @@
+diff --git a/src/lerobot/robots/alohamini/alohamini.py b/src/lerobot/robots/alohamini/alohamini.py
+index 39433fd..6bdd6b3 100644
+--- a/src/lerobot/robots/alohamini/alohamini.py
++++ b/src/lerobot/robots/alohamini/alohamini.py
+@@ -211,7 +211,7 @@ class AlohaMini(Robot):
+             "base_left_wheel": Motor(8, bm, MotorNormMode.RANGE_M100_100),
+             "base_back_wheel": Motor(9, bm, MotorNormMode.RANGE_M100_100),
+             "base_right_wheel": Motor(10, bm, MotorNormMode.RANGE_M100_100),
+-            "lift_axis": Motor(11, lm, MotorNormMode.DEGREES),
++            **({} if config.no_lift else {"lift_axis": Motor(11, lm, MotorNormMode.DEGREES)}),
+         }
+         left_bus_calibration = {
+             name: calibration for name, calibration in self.calibration.items() if name in left_bus_motors
+@@ -253,7 +253,7 @@ class AlohaMini(Robot):
+         self.cameras = make_cameras_from_configs(config.cameras)
+ 
+         self.lift = LiftAxis(
+-            LiftAxisConfig(lead_mm_per_rev=specs["lead_mm_per_rev"], motor_model=lm),
++            LiftAxisConfig(enabled=not config.no_lift, lead_mm_per_rev=specs["lead_mm_per_rev"], motor_model=lm),
+             bus_left=self.left_bus,
+             bus_right=self.right_bus,
+         )
+diff --git a/src/lerobot/robots/alohamini/config_alohamini.py b/src/lerobot/robots/alohamini/config_alohamini.py
+index a8c5ba9..ab62f07 100644
+--- a/src/lerobot/robots/alohamini/config_alohamini.py
++++ b/src/lerobot/robots/alohamini/config_alohamini.py
+@@ -81,6 +81,9 @@ class AlohaMiniConfig(RobotConfig):
+     # Use together with --no_leader on the teleoperate side for base-only teleoperation.
+     no_follower: bool = False
+ 
++    # When True, this robot has no lift motor (ID 11); skip it entirely.
++    no_lift: bool = False
++
+     def __post_init__(self) -> None:
+         super().__post_init__()
+         if not 1 <= self.arm_goal_velocity <= 3400:
+diff --git a/src/lerobot/robots/alohamini/lift_axis.py b/src/lerobot/robots/alohamini/lift_axis.py
+index ff9dcb2..26211f8 100644
+--- a/src/lerobot/robots/alohamini/lift_axis.py
++++ b/src/lerobot/robots/alohamini/lift_axis.py
+@@ -147,7 +147,10 @@ class LiftAxis:
+     # Lightweight coupling with action/obs
+     def contribute_observation(self, obs: Dict[str, float]) -> None:
+         """Export convenient observation fields: height_mm and velocity"""
+-        if not self.enabled: return
++        if not self.enabled:
++            # Keep the declared key present so clients do not KeyError.
++            obs[f"{self.cfg.name}.height_mm"] = 0.0
++            return
+         obs[f"{self.cfg.name}.height_mm"] = self.get_height_mm()
+         try:
+             obs[f"{self.cfg.name}.vel"] = int(self._bus.read("Present_Velocity", self.cfg.name, normalize=False))
