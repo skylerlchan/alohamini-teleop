@@ -19,6 +19,12 @@ Binds to 127.0.0.1 only. Tailscale publishes it:
 Either way the passcode is the gate. Humans type it on the page; agents send
     Authorization: Bearer <passcode>
 
+The same server publishes a read-only twin of the hardware. The control loop
+samples Present_Position (arms and lift) and Present_Velocity (wheels) and
+serves it at GET /twin/state and GET /twin/stream (server-sent events). The
+page shows those ticks. twin/twin_view.py on a laptop turns them into a
+MuJoCo pose. Nothing on this path writes a goal register.
+
 WHY THE STOP PATH IS THE WAY IT IS
 Feetech servos LATCH the last velocity command: they keep spinning until told
 otherwise. An early version zeroed the wheels only in a `finally` block, so a
@@ -105,7 +111,9 @@ PORT = 8080
 # replugs and reboots, and sometimes only one board is connected. So never
 # hardcode it: find the bus by asking which one answers on the wheel IDs.
 WHEEL_IDS = (8, 9, 10)
+WHEEL_NAMES = ("base_left_wheel", "base_back_wheel", "base_right_wheel")
 LIFT_ID = 11
+TWIN_MIN_HZ = 40.0          # skip position reads when the control loop is already late
 
 SESSION_TTL_S = 12 * 3600
 MAX_FAILS = 10              # failed codes before a lockout
@@ -133,6 +141,20 @@ _arms = {s: {"state": "off", "goal": None, "start": None, "t0": 0.0, "queue": []
          for s in ("left", "right")}
 _arm_req = {"on": False}
 _shutdown = threading.Event()
+_lift_lim = None            # [lo, hi] ticks, read once at startup
+_twin_cond = threading.Condition()
+_twin_div = 0
+_twin_backoff = {"left": 0.0, "right": 0.0, "lift": 0.0, "wheels": 0.0}
+_twin_log_t = {"left": 0.0, "right": 0.0, "lift": 0.0, "wheels": 0.0}
+_twin = {
+    "seq": 0, "t": 0.0, "stale": False, "battery_v": None,
+    "loop_hz": None, "sample_hz": None,
+    "base": {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+    "lift": {"present": False, "tick": None, "vel": None, "lim": None},
+    "wheels": {"present": False, "vel": None},
+    "left": {"present": False, "tick": None, "lim": None},
+    "right": {"present": False, "tick": None, "lim": None},
+}
 # Positive lift command should raise the carriage. lerobot's LiftAxisConfig uses
 # dir_sign = -1, so match it. Flip if up and down come out swapped.
 LIFT_DIR = -1
@@ -404,6 +426,11 @@ def control_loop():
         except Exception as exc:
             _stats["last_error"] = f"arms: {type(exc).__name__}: {exc}"
             log.error("arm step failed: %s", exc)
+        try:
+            _twin_sample(_stats.get("loop_hz") or LOOP_HZ)
+        except Exception as exc:
+            _stats["last_error"] = f"twin: {type(exc).__name__}: {exc}"
+            log.error("twin sample failed: %s", exc)
         time.sleep(max(0.0, period - (time.perf_counter() - start)))
 
 
@@ -533,6 +560,142 @@ def _arm_status():
             "req_on": _arm_req["on"],
             **{s: {"state": _arms[s]["state"], "lag_ticks": _arms[s]["err"],
                    "present": bool(_flim[s])} for s in ("left", "right")}}
+
+
+def _signed_vel(v) -> int:
+    """Feetech velocity is signed, or sign-magnitude with bit 15 as the sign."""
+    v = int(v)
+    if v < 0:
+        return v
+    if v & 0x8000:
+        return -(v & 0x7FFF)
+    return v
+
+
+def _lim_pairs(side):
+    if not _flim[side]:
+        return None
+    return [[int(_flim[side][j][0]), int(_flim[side][j][1])] for j in JOINTS]
+
+
+def _twin_read(slot, fn):
+    """Run a bus read. On failure, back off for 0.5 s so a dead servo cannot stall the loop."""
+    now = time.time()
+    if now < _twin_backoff[slot]:
+        return None, True
+    try:
+        return fn(), False
+    except Exception as exc:
+        _twin_backoff[slot] = now + 0.5
+        if now - _twin_log_t[slot] > 5:
+            log.warning("twin %s read failed: %s", slot, exc)
+            _twin_log_t[slot] = now
+        return None, True
+
+
+def _twin_copy_locked():
+    """Caller holds _twin_cond."""
+    def arm(side):
+        a = _twin[side]
+        return {"present": a["present"],
+                "tick": None if a["tick"] is None else list(a["tick"]),
+                "lim": None if a["lim"] is None else [list(p) for p in a["lim"]]}
+    lift, wheels = _twin["lift"], _twin["wheels"]
+    return {"seq": _twin["seq"], "t": _twin["t"], "stale": _twin["stale"],
+            "battery_v": _twin["battery_v"], "loop_hz": _twin["loop_hz"],
+            "sample_hz": _twin["sample_hz"], "base": dict(_twin["base"]),
+            "lift": {"present": lift["present"], "tick": lift["tick"], "vel": lift["vel"],
+                     "lim": None if lift["lim"] is None else list(lift["lim"])},
+            "wheels": {"present": wheels["present"],
+                       "vel": None if wheels["vel"] is None else list(wheels["vel"])},
+            "left": arm("left"), "right": arm("right")}
+
+
+def _twin_public():
+    with _twin_cond:
+        return _twin_copy_locked()
+
+
+def _twin_sample(loop_hz: float):
+    """Read present positions for the digital twin. Control thread only. Reads, never writes."""
+    global _twin_div
+    _twin_div += 1
+    if _twin_div % 2 or loop_hz < TWIN_MIN_HZ:
+        return
+    stale = False
+    arms = {}
+    for side in ("left", "right"):
+        bus = _arm_bus(side)
+        if bus is None or not _flim[side]:
+            arms[side] = {"present": False, "tick": None}
+            continue
+        names = _arm_names(side)
+        def read_arm(b=bus, n=names):
+            got = b.sync_read("Present_Position", n, normalize=False)
+            return [int(got[name]) for name in n]
+        got, failed = _twin_read(side, read_arm)
+        stale = stale or failed
+        if got is None:
+            arms[side] = None
+        else:
+            arms[side] = {"present": True, "tick": got}
+    lift = None
+    if _lift_bus is None or not _stats.get("lift_present"):
+        lift = {"present": False, "tick": None, "vel": None}
+    elif not _stats.get("lift_ok", True):
+        stale = True
+    else:
+        def read_lift():
+            tick = int(_lift_bus.read("Present_Position", "lift_axis", normalize=False, num_retry=0))
+            vel = _signed_vel(_lift_bus.read("Present_Velocity", "lift_axis", normalize=False, num_retry=0))
+            return tick, vel
+        got, failed = _twin_read("lift", read_lift)
+        stale = stale or failed
+        if got is not None:
+            lift = {"present": True, "tick": got[0], "vel": got[1]}
+    wheels = None
+    if _busL is None:
+        wheels = {"present": False, "vel": None}
+    else:
+        def read_wheels():
+            got = _busL.sync_read("Present_Velocity", list(WHEEL_NAMES), normalize=False)
+            return [_signed_vel(got[n]) for n in WHEEL_NAMES]
+        got, failed = _twin_read("wheels", read_wheels)
+        stale = stale or failed
+        if got is not None:
+            wheels = {"present": True, "vel": got}
+    with _lock:
+        base = {k: round(float(_stats["actual"].get(k, 0.0)), 3) for k in ("vx", "vy", "wz")}
+        batt = _stats.get("battery_v")
+        hz = _stats.get("loop_hz")
+        lims = {s: _lim_pairs(s) for s in ("left", "right")}
+        lift_lim = list(_lift_lim) if _lift_lim else None
+    now = time.time()
+    with _twin_cond:
+        prev_t = _twin["t"]
+        _twin["seq"] += 1
+        _twin["t"] = now
+        _twin["stale"] = stale
+        _twin["battery_v"] = batt
+        _twin["loop_hz"] = hz
+        if prev_t:
+            inst = 1.0 / max(1e-3, now - prev_t)
+            old = _twin["sample_hz"] if _twin["sample_hz"] is not None else inst
+            _twin["sample_hz"] = round(0.8 * old + 0.2 * inst, 1)
+        _twin["base"] = base
+        for side in ("left", "right"):
+            if arms[side] is None:
+                _twin[side]["lim"] = lims[side]
+            else:
+                _twin[side] = {**arms[side], "lim": lims[side]}
+        if lift is None:
+            _twin["lift"]["lim"] = lift_lim
+        else:
+            lift["lim"] = lift_lim
+            _twin["lift"] = lift
+        if wheels is not None:
+            _twin["wheels"] = wheels
+        _twin_cond.notify_all()
 
 
 def leader_server():
@@ -669,6 +832,8 @@ PAGE = """<!doctype html>
  .hud{display:flex;gap:6px 16px;flex-wrap:wrap;font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
    color:var(--dim);margin:0 0 8px;padding:6px 10px;border:1px solid var(--off);border-radius:10px;background:#0d0f12}
  .hud b{font-weight:700} .g{color:var(--live)} .y{color:#f0c674} .r{color:var(--stop)}
+ .tw{margin:0 0 10px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);text-align:left}
+ .tw b{color:var(--fg);font-weight:600}
  .batt{margin-left:14px;padding:2px 8px;border-radius:999px;border:1px solid var(--off);font-variant-numeric:tabular-nums}
  .batt.ok{color:var(--live);border-color:#1f5a38} .batt.mid{color:#f0c674;border-color:#5a4a2a} .batt.low{color:var(--stop);border-color:#5a2a2e}
  .arms{margin:22px auto 0;padding-top:14px;border-top:1px solid var(--off)}
@@ -702,6 +867,13 @@ PAGE = """<!doctype html>
   <span>ARM LAG <b id="hlag">–</b></span><span>LOOP <b id="hloop">–</b></span>
   <span>CAM <b id="hcam">–</b></span>
 </div>
+<div class="hud" id="twinhud">
+  <span>TWIN <b id="twinst">–</b></span>
+  <span>LIFT TICK <b id="twlift">–</b></span>
+  <span>WHEELS <b id="twwheel">–</b></span>
+</div>
+<div class="tw" id="twjoints">left –<br>right –</div>
+<div class="note" id="twurl"></div>
 <div class="warn" id="liftwarn2" hidden></div>
 <div class="camgrid" id="camgrid" hidden></div>
 
@@ -795,8 +967,22 @@ function paint(v){
   vx.textContent=v.vx.toFixed(2); vy.textContent=v.vy.toFixed(2); wz.textContent=v.wz.toFixed(2);
   document.querySelectorAll("button[data-k]").forEach(b=>b.classList.toggle("on", held.has(b.dataset.k)));
 }
-let pingEma=null;
+let pingEma=null, twinSeq=-1;
 function grade(el,val,good,ok,txt){ el.textContent=txt; el.className = val==null?"":(val<=good?"g":(val<=ok?"y":"r")); }
+function fmtArm(a){ return (!a||!a.present||!a.tick) ? "missing" : a.tick.join(" "); }
+function paintTwin(t){
+  if(!t || t.seq==null || t.seq<twinSeq) return;
+  twinSeq=t.seq;
+  twinst.textContent=(t.stale?"stale · ":"")+"#"+t.seq+(t.sample_hz!=null?" · "+t.sample_hz+" Hz":"");
+  twinst.className=t.stale?"r":"g";
+  const L=t.lift;
+  twlift.textContent=(!L||!L.present)?"missing":(L.tick==null?"–":L.tick+(L.vel!=null?" · vel "+L.vel:""));
+  const w=t.wheels;
+  twwheel.textContent=(!w||!w.present||!w.vel)?"–":w.vel.join(" ");
+  twjoints.innerHTML="left <b>"+fmtArm(t.left)+"</b> &nbsp; pan lift elbow wflex wroll grip<br>right <b>"+fmtArm(t.right)+"</b>";
+}
+twurl.textContent="MuJoCo twin stream: "+location.origin+"/twin/stream";
+new EventSource("/twin/stream").onmessage=ev=>{ try{ paintTwin(JSON.parse(ev.data)); }catch(e){} };
 async function send(){
   const v=vel(); paint(v);
   const t0=performance.now();
@@ -830,6 +1016,7 @@ async function send(){
       al.textContent = a.left.present ? a.left.state+(a.left.state==="on"?" · lag "+a.left.lag_ticks:"") : "missing";
       ar.textContent = a.right.present ? a.right.state+(a.right.state==="on"?" · lag "+a.right.lag_ticks:"") : "missing";
       armon.classList.toggle("on", a.req_on); }
+    if(j.twin) paintTwin(j.twin);
     dot.classList.add("live");
     state.textContent="connected · "+j.sent+" commands · "+j.watchdog_stops+" auto-stops";
   }catch(e){ dot.classList.remove("live"); state.textContent="lost connection to the robot"; }
@@ -996,12 +1183,47 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json({"error": "unauthorized"}, 401)
             return
-        if self.path == "/status":
+        path = self.path.split("?", 1)[0]
+        if path == "/status":
             with _lock:
                 body = {**_stats, **_target}
-            self._json({**body, "arms": _arm_status()})
+            self._json({**body, "arms": _arm_status(), "twin": _twin_public()})
+            return
+        if path == "/twin/state":
+            self._json(_twin_public())
+            return
+        if path == "/twin/stream":
+            self._stream_twin()
             return
         self._json({"error": "not found"}, 404)
+
+    def _stream_twin(self):
+        """Server-sent events of the latest twin snapshot. One event per new sample."""
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            last = -1
+            while not _shutdown.is_set():
+                with _twin_cond:
+                    _twin_cond.wait(timeout=1.0)
+                    if _twin["seq"] == last:
+                        payload = None
+                    else:
+                        payload = _twin_copy_locked()
+                if payload is None:
+                    self.wfile.write(b": keepalive\n\n")
+                else:
+                    self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+                    last = payload["seq"]
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        except Exception as exc:
+            log.warning("twin stream ended: %s", exc)
 
     def do_POST(self):
         global _last_cmd
@@ -1066,7 +1288,8 @@ class Handler(BaseHTTPRequestHandler):
                         "loop_hz": _stats.get("loop_hz"), "lift_error": _stats.get("lift_error"),
                         "cam_fps": {str(k): v["fps"] for k, v in _cam_fps.items()},
                         "watchdog_stops": _stats["watchdog_stops"],
-                        "actual": _stats["actual"], "arms": _arm_status()})
+                        "actual": _stats["actual"], "arms": _arm_status(),
+                        "twin": _twin_public()})
             return
         with _lock:
             _target["vx"] = clamp(float(d.get("vx", 0.0) or 0.0), -MAX_VX, MAX_VX)
@@ -1086,7 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
                     "cam_fps": {str(k): v["fps"] for k, v in _cam_fps.items()},
                     "watchdog_stops": _stats["watchdog_stops"],
                     "actual": _stats["actual"], "seat": seat, **_target}
-        self._json({**resp, "arms": _arm_status()})
+        self._json({**resp, "arms": _arm_status(), "twin": _twin_public()})
 
 
 # ----------------------------------------------------------------- cameras --
@@ -1275,7 +1498,7 @@ def _open_bus(port, motors):
 
 
 def main():
-    global _robot, _busL, _busR, _lift_bus
+    global _robot, _busL, _busR, _lift_bus, _lift_lim
 
     wheel_port, lift_port = find_buses()
     if wheel_port is None:
@@ -1298,7 +1521,7 @@ def main():
     arm = lambda side: {f"{side}_{j}": Motor(i, "sts3215", MotorNormMode.RANGE_M100_100)
                         for j, i in zip(JOINTS, ARM_IDS)}
     wheels = {n: Motor(i, "sts3215", MotorNormMode.RANGE_M100_100)
-              for n, i in zip(("base_left_wheel", "base_back_wheel", "base_right_wheel"), WHEEL_IDS)}
+              for n, i in zip(WHEEL_NAMES, WHEEL_IDS)}
     left_found = _ping_ids(wheel_port, ARM_IDS)
     _busL = _open_bus(wheel_port, {**(arm("left") if len(left_found) == 6 else {}), **wheels})
     _stats["connected"] = True
@@ -1336,6 +1559,11 @@ def main():
             _busR.enable_torque("lift_axis")
             _lift_bus = _busR
             _stats["lift_present"] = True
+            try:
+                _lift_lim = [int(_lift_bus.read("Min_Position_Limit", "lift_axis", normalize=False)),
+                             int(_lift_bus.read("Max_Position_Limit", "lift_axis", normalize=False))]
+            except Exception as exc:
+                log.warning("lift limits unreadable: %s", exc)
             log.info("lift ready in velocity mode on %s", right_port)
         except Exception as exc:
             log.error("lift setup failed, disabling it: %s", exc)
@@ -1365,7 +1593,7 @@ def main():
     threading.Thread(target=leader_server, daemon=True).start()
 
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    log.info("listening on http://%s:%d (loopback only)", BIND, PORT)
+    log.info("listening on http://%s:%d (loopback only); twin at /twin/stream", BIND, PORT)
     log.info("PASSCODE: %s   (also at %s)", PASSCODE, STATE_DIR / "passcode")
     try:
         srv.serve_forever()

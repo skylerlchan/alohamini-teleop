@@ -1,0 +1,23 @@
+{
+  "note": "joint_sign -1 flips that horn. lift_sign -1 flips carriage travel. wheel_sign order is left, back, right. The base starts at the origin and is odometry from commanded vx/vy/wz. The lift starts at lift_start_m and then follows unwrapped tick deltas (the servo position wraps every revolution). Press R in the viewer to zero the base and re-anchor the lift.",
+  "joint_sign": {
+    "left_shoulder_pan": 1,
+    "left_shoulder_lift": 1,
+    "left_elbow_flex": 1,
+    "left_wrist_flex": 1,
+    "left_wrist_roll": 1,
+    "left_gripper": 1,
+    "right_shoulder_pan": 1,
+    "right_shoulder_lift": 1,
+    "right_elbow_flex": 1,
+    "right_wrist_flex": 1,
+    "right_wrist_roll": 1,
+    "right_gripper": 1
+  },
+  "lift_sign": 1,
+  "lift_mm_per_rev": 84.0,
+  "lift_start_m": 0.2,
+  "ticks_per_rev": 4096,
+  "wheel_sign": [1, 1, 1],
+  "wheel_rad_per_raw": 0.0015338235
+}
