@@ -251,6 +251,14 @@ def _code_ok(code: str) -> bool:
                                PASSCODE.upper())
 
 
+def _version() -> str:
+    """Live git commit, written by deploy/autodeploy.sh. Shown in the page header."""
+    try:
+        return "v " + (STATE_DIR / "deployed_sha").read_text().strip()[:7]
+    except OSError:
+        return "v ?"
+
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
@@ -667,6 +675,7 @@ PAGE = """<!doctype html>
  .arms .cap{font-size:11px;color:var(--dim);text-align:center;margin-bottom:8px}
  .armrow{display:grid;grid-template-columns:1fr 1fr;gap:10px}
  button.limp{color:#f0c674}
+ .ver{margin-left:10px;font:11px ui-monospace,Menlo,monospace;color:var(--dim);text-decoration:none}
  .seat{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 10px;padding:10px 12px;
    border:1px solid var(--off);border-radius:12px;background:#0d0f12}
  .seat.you{border-color:#1f5a38;background:#0f1d15}
@@ -679,7 +688,8 @@ PAGE = """<!doctype html>
 <div class="wrap">
 <h1>AlohaMini teleop</h1>
 <div class="sub"><span id="dot" class="dot"></span><span id="state">connecting…</span>
-  <span class="batt" id="batt">battery —</span></div>
+  <span class="batt" id="batt">battery —</span>
+  <a class="ver" href="https://github.com/skylerlchan/alohamini-teleop/commits/main" target="_blank" title="live version: edit on GitHub">%VER%</a></div>
 <div class="warn" id="battwarn" hidden>Battery low. Park the arms and charge soon: when it drops out, the Pi and every motor lose power at once.</div>
 
 <div class="seat" id="seatbar">
@@ -979,7 +989,8 @@ class Handler(BaseHTTPRequestHandler):
             page = (PAGE.replace("%MAXV%", str(MAX_VX)).replace("%MAXW%", str(MAX_WZ))
                         .replace("%MAXL%", str(MAX_LIFT_VEL)).replace("%BATTLOW%", str(BATT_LOW)).replace("%LIFTID%", str(LIFT_ID))
                         .replace("%LIFT%", "true" if _stats["lift_present"] else "false")
-                        .replace("%CAMS%", json.dumps(_cams)))
+                        .replace("%CAMS%", json.dumps(_cams))
+                        .replace("%VER%", _version()))
             self._send(page.encode(), "text/html; charset=utf-8")
             return
         if not self._authed():
