@@ -1,0 +1,8 @@
+[Unit]
+Description=AlohaMini: pull main from GitHub and deploy it
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=skyler
+ExecStart=/home/skyler/alohamini-teleop/deploy/autodeploy.sh

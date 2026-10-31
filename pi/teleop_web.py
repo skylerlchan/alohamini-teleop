@@ -1134,15 +1134,25 @@ class CamFeed:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
                 cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # These cameras only run at 30 fps (they ignore the 12 fps request).
+                # Reading at 12 fps left a full queue of old frames, so every frame
+                # sent was ~4 reads (~330 ms) stale. So grab() EVERY frame, which is
+                # cheap (no decode), and decode + send only the newest at CAM_FPS.
                 period = 1.0 / CAM_FPS
+                t_sent = 0.0
                 while not _shutdown.is_set():
                     with self.cond:
                         if self.viewers <= 0 and time.time() - self.t_left > CAM_LINGER_S:
                             break
-                    t0 = time.perf_counter()
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
+                    if not cap.grab():
                         time.sleep(0.05)
+                        continue
+                    if time.perf_counter() - t_sent < period:
+                        continue
+                    t_sent = time.perf_counter()
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
                         continue
                     ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), CAM_QUALITY])
                     if not ok:
@@ -1155,7 +1165,6 @@ class CamFeed:
                     c["n"] += 1
                     if now - c["t"] >= 1.0:
                         c["fps"], c["n"], c["t"] = round(c["n"] / (now - c["t"]), 1), 0, now
-                    time.sleep(max(0.0, period - (time.perf_counter() - t0)))
             except Exception as exc:
                 log.warning("camera %d capture error: %s", self.idx, exc)
                 time.sleep(1.0)

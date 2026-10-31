@@ -15,6 +15,7 @@ Drive an [AlohaMini](https://github.com/liyiteng/lerobot_alohamini) robot from a
 | `pi/teleop_web.py` | Pi | Web server, control loop, cameras, seat logic |
 | `mac/leader_bridge.py` | Laptop | Streams leader-arm positions to the Pi over SSH |
 | `deploy/alohamini-teleop.service` | Pi | systemd unit: start at boot, restart on failure |
+| `deploy/autodeploy.sh` + `alohamini-autodeploy.{service,timer}` | Pi | Pulls `main` every 30 s and deploys it, with rollback |
 | `patches/lerobot_alohamini-no-lift.patch` | Pi | Adds `no_lift` to lerobot_alohamini for robots without a lift motor |
 
 ## Setup on the Pi
@@ -36,6 +37,25 @@ Drive an [AlohaMini](https://github.com/liyiteng/lerobot_alohamini) robot from a
 The server binds to `127.0.0.1:8080` only. To reach it, use an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 <pi>`), or publish it with Tailscale (`tailscale serve` / `tailscale funnel`) or a Cloudflare Tunnel. In our tests, a Cloudflare Tunnel was about 3x faster than Tailscale Funnel: ~100 ms vs ~320 ms per command, with full camera frame rate.
 
 Agents can skip the login page by sending `Authorization: Bearer <passcode>`.
+
+## Changing the website (auto-deploy)
+
+Anyone with write access to this repo can change the live robot. Edit `pi/teleop_web.py` (the page's HTML, CSS and JavaScript live inside it, in `PAGE`) and push to `main`. Within about 30 seconds the Pi:
+
+1. pulls `main`,
+2. rejects the change if it doesn't compile,
+3. waits until nobody is driving,
+4. installs it and restarts the robot server,
+5. checks the page answers, and **puts the previous version back** if it doesn't come up within 60 s.
+
+Every step is logged on the Pi in `~/deploy.log`. Test bigger changes on a branch first and merge when they work. A restart stops the robot and the page reloads, so tell the team before you push.
+
+Set up once on the Pi:
+```bash
+git clone https://github.com/skylerlchan/alohamini-teleop ~/alohamini-teleop
+sudo cp ~/alohamini-teleop/deploy/alohamini-autodeploy.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now alohamini-autodeploy.timer
+```
 
 ## Leader arms (optional)
 

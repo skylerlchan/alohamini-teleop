@@ -1,0 +1,10 @@
+[Unit]
+Description=AlohaMini: check GitHub for new code every 30 s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
